@@ -1,0 +1,263 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
+/**
+ * @title UniversalContract
+ * @dev Universal smart contract with roles, pause functionality, reentrancy protection,
+ *      asset management, and audit events.
+ *      Supports both native currency (ETH/BNB/MATIC) and ERC20 tokens.
+ */
+contract UniversalContract is AccessControl, Pausable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    using Address for address;
+
+    // ============================================================
+    // ROLES
+    // ============================================================
+
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+    bytes32 public constant TREASURY_ROLE = keccak256("TREASURY_ROLE");
+
+    // ============================================================
+    // EVENTS
+    // ============================================================
+
+    event Deposited(address indexed from, uint256 amount, address token);
+    event Withdrawn(address indexed to, uint256 amount, address token);
+    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
+    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
+    event ContractPaused(address indexed by);
+    event ContractUnpaused(address indexed by);
+    event EmergencyWithdraw(address indexed token, uint256 amount, address indexed to);
+
+    // ============================================================
+    // STORAGE
+    // ============================================================
+
+    /**
+     * @dev Generic key-value storage for additional data
+     *      Useful for upgradeable patterns or storing config
+     */
+    mapping(bytes32 => bytes32) public storageData;
+
+    // ============================================================
+    // CONSTRUCTOR
+    // ============================================================
+
+    /**
+     * @dev Grants all roles to the contract deployer
+     */
+    constructor() {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
+        _grantRole(OPERATOR_ROLE, msg.sender);
+        _grantRole(TREASURY_ROLE, msg.sender);
+    }
+
+    // ============================================================
+    // MODIFIERS
+    // ============================================================
+
+    modifier onlyAdmin() {
+        require(hasRole(ADMIN_ROLE, msg.sender), "Not admin");
+        _;
+    }
+
+    modifier onlyOperator() {
+        require(hasRole(OPERATOR_ROLE, msg.sender), "Not operator");
+        _;
+    }
+
+    modifier onlyTreasury() {
+        require(hasRole(TREASURY_ROLE, msg.sender), "Not treasury");
+        _;
+    }
+
+    // ============================================================
+    // ROLE MANAGEMENT
+    // ============================================================
+
+    /**
+     * @dev Grant a role to an account (admin only)
+     * @param role Role identifier (keccak256 hash)
+     * @param account Address to receive the role
+     */
+    function grantRole(bytes32 role, address account) public override onlyAdmin {
+        _grantRole(role, account);
+        emit RoleGranted(role, account, msg.sender);
+    }
+
+    /**
+     * @dev Revoke a role from an account (admin only)
+     * @param role Role identifier (keccak256 hash)
+     * @param account Address to lose the role
+     */
+    function revokeRole(bytes32 role, address account) public override onlyAdmin {
+        _revokeRole(role, account);
+        emit RoleRevoked(role, account, msg.sender);
+    }
+
+    // ============================================================
+    // PAUSE / UNPAUSE
+    // ============================================================
+
+    /**
+     * @dev Pause all protected functions (admin only)
+     */
+    function pause() external onlyAdmin {
+        _pause();
+        emit ContractPaused(msg.sender);
+    }
+
+    /**
+     * @dev Unpause all protected functions (admin only)
+     */
+    function unpause() external onlyAdmin {
+        _unpause();
+        emit ContractUnpaused(msg.sender);
+    }
+
+    // ============================================================
+    // DEPOSIT FUNCTIONS
+    // ============================================================
+
+    /**
+     * @dev Receive native currency (ETH/BNB/MATIC)
+     *      Emits deposit event for tracking
+     */
+    receive() external payable whenNotPaused {
+        emit Deposited(msg.sender, msg.value, address(0));
+    }
+
+    /**
+     * @dev Deposit ERC20 tokens into the contract
+     * @param token ERC20 token address
+     * @param amount Amount of tokens to deposit
+     */
+    function depositERC20(address token, uint256 amount) external whenNotPaused nonReentrant {
+        require(amount > 0, "Amount must be > 0");
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        emit Deposited(msg.sender, amount, token);
+    }
+
+    // ============================================================
+    // WITHDRAW FUNCTIONS
+    // ============================================================
+
+    /**
+     * @dev Withdraw native currency (treasury only)
+     * @param to Recipient address
+     * @param amount Amount to withdraw in wei
+     */
+    function withdrawNative(address payable to, uint256 amount) external onlyTreasury whenNotPaused nonReentrant {
+        require(amount <= address(this).balance, "Insufficient balance");
+        (bool sent, ) = to.call{value: amount}("");
+        require(sent, "Transfer failed");
+        emit Withdrawn(to, amount, address(0));
+    }
+
+    /**
+     * @dev Withdraw ERC20 tokens (treasury only)
+     * @param token ERC20 token address
+     * @param to Recipient address
+     * @param amount Amount of tokens to withdraw
+     */
+    function withdrawERC20(address token, address to, uint256 amount) external onlyTreasury whenNotPaused nonReentrant {
+        require(amount > 0, "Amount must be > 0");
+        IERC20(token).safeTransfer(to, amount);
+        emit Withdrawn(to, amount, token);
+    }
+
+    // ============================================================
+    // EMERGENCY FUNCTIONS
+    // ============================================================
+
+    /**
+     * @dev Emergency withdrawal of all funds (admin only)
+     *      Use this if the contract is compromised or stuck
+     * @param token Token address (use address(0) for native currency)
+     * @param to Recipient address for all funds
+     */
+    function emergencyWithdraw(address token, address to) external onlyAdmin {
+        if (token == address(0)) {
+            uint256 balance = address(this).balance;
+            (bool sent, ) = to.call{value: balance}("");
+            require(sent, "Emergency transfer failed");
+            emit EmergencyWithdraw(token, balance, to);
+        } else {
+            uint256 balance = IERC20(token).balanceOf(address(this));
+            IERC20(token).safeTransfer(to, balance);
+            emit EmergencyWithdraw(token, balance, to);
+        }
+    }
+
+    // ============================================================
+    // UNIVERSAL STORAGE (for upgradeable patterns)
+    // ============================================================
+
+    /**
+     * @dev Store arbitrary data in the contract (admin only)
+     * @param key Unique identifier for the data
+     * @param value Data to store (32 bytes)
+     */
+    function setData(bytes32 key, bytes32 value) external onlyAdmin {
+        storageData[key] = value;
+    }
+
+    /**
+     * @dev Retrieve arbitrary data from the contract
+     * @param key Unique identifier for the data
+     * @return Stored 32-byte value
+     */
+    function getData(bytes32 key) external view returns (bytes32) {
+        return storageData[key];
+    }
+
+    // ============================================================
+    // VIEW FUNCTIONS
+    // ============================================================
+
+    /**
+     * @dev Get the contract's native currency balance
+     * @return Balance in wei
+     */
+    function getNativeBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    /**
+     * @dev Get the contract's ERC20 token balance
+     * @param token ERC20 token address
+     * @return Token balance
+     */
+    function getERC20Balance(address token) external view returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
+    }
+
+    // ============================================================
+    // UPGRADEABLE PROXY COMPATIBILITY
+    // ============================================================
+
+    /**
+     * @dev Initialize function for proxy patterns (UUPS / Transparent)
+     *      Uncomment and use this instead of constructor when deploying
+     *      as logic contract behind a proxy
+     * 
+     * @param initialAdmin Address to receive all admin roles
+     */
+    // function initialize(address initialAdmin) external initializer {
+    //     __AccessControl_init();
+    //     _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
+    //     _grantRole(ADMIN_ROLE, initialAdmin);
+    //     _grantRole(OPERATOR_ROLE, initialAdmin);
+    //     _grantRole(TREASURY_ROLE, initialAdmin);
+    // }
+}
